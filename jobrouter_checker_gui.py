@@ -1192,48 +1192,166 @@ class BrowserWorker(QThread):
                     }
                 """)
 
-                self.debug_signal.emit(f"Gefundene Elemente: {len(pdf_elements)}")
-                for elem in pdf_elements:
-                    self.debug_signal.emit(f"  • {elem['type']}: {elem.get('src', 'keine src')[:100]}")
+                self.debug_signal.emit(f"Gefundene Elemente: {len(pdf_elements) if pdf_elements else 0}")
+                if pdf_elements:
+                    for elem in pdf_elements:
+                        if elem is None:
+                            continue
+                        try:
+                            elem_type = elem.get('type', 'unbekannt')
+                            elem_src = elem.get('src', 'keine src')
+                            if elem_src and len(elem_src) > 100:
+                                elem_src = elem_src[:100]
+                            self.debug_signal.emit(f"  • {elem_type}: {elem_src}")
+                        except Exception as e:
+                            self.debug_signal.emit(f"  • Fehler beim Anzeigen: {str(e)}")
 
                 # Versuche PDF aus jedem gefundenen Element zu laden
-                for elem in pdf_elements:
-                    src = elem.get('src')
-                    if not src:
-                        continue
+                if pdf_elements:
+                    for elem in pdf_elements:
+                        if elem is None:
+                            continue
 
-                    # Ignoriere leere oder ungültige URLs
-                    if src in ['about:blank', '', None]:
-                        continue
+                        src = elem.get('src')
+                        if not src:
+                            continue
 
-                    # Prüfe ob es ein PDF sein könnte
-                    is_pdf_candidate = (
-                        'pdf' in src.lower() or
-                        elem.get('contentType', '').lower() == 'application/pdf' or
-                        '.pdf' in src.lower()
-                    )
+                        # Ignoriere leere oder ungültige URLs
+                        if src in ['about:blank', '', None]:
+                            continue
 
-                    if is_pdf_candidate:
-                        try:
-                            self.log_signal.emit(f"📄 PDF-Element gefunden ({elem['type']}): {src[:80]}")
-                            self.debug_signal.emit(f"Versuche PDF zu laden von: {src}")
+                        # Prüfe ob es ein PDF sein könnte
+                        is_pdf_candidate = (
+                            'pdf' in src.lower() or
+                            elem.get('contentType', '').lower() == 'application/pdf' or
+                            '.pdf' in src.lower()
+                        )
 
-                            # Versuche direkten Download
-                            response = await self.page.context.request.get(src)
-                            if response.ok:
-                                body = await response.body()
-                                if len(body) > 1000:
-                                    self.captured_pdfs.append(body)
-                                    self.log_signal.emit(f"✅ PDF aus {elem['type']} geladen ({len(body)} bytes)")
-                                    break
-                            else:
-                                self.debug_signal.emit(f"   ✗ Response status: {response.status}")
-                        except Exception as e:
-                            self.debug_signal.emit(f"   ✗ Fehler beim Laden: {e}")
+                        if is_pdf_candidate:
+                            try:
+                                self.log_signal.emit(f"📄 PDF-Element gefunden ({elem.get('type', 'unbekannt')}): {src[:80]}")
+                                self.debug_signal.emit(f"Versuche PDF zu laden von: {src}")
 
-                # Methode 2: Prüfe alle Frames (Fallback)
+                                # Versuche direkten Download
+                                response = await self.page.context.request.get(src)
+                                if response.ok:
+                                    body = await response.body()
+                                    if len(body) > 1000:
+                                        self.captured_pdfs.append(body)
+                                        self.log_signal.emit(f"✅ PDF aus {elem.get('type', 'unbekannt')} geladen ({len(body)} bytes)")
+                                        break
+                                else:
+                                    self.debug_signal.emit(f"   ✗ Response status: {response.status}")
+                            except Exception as e:
+                                self.debug_signal.emit(f"   ✗ Fehler beim Laden: {e}")
+
+                # Methode 2: Suche JavaScript-generierte PDF-URLs
                 if not self.captured_pdfs:
-                    self.debug_signal.emit("\n📌 Methode 2: Prüfe alle Frames...")
+                    self.debug_signal.emit("\n📌 Methode 2: Suche JavaScript-generierte PDFs...")
+
+                    try:
+                        # Suche nach allen window.open oder ähnlichen JavaScript-Aufrufen
+                        js_pdf_info = await self.page.evaluate("""
+                            () => {
+                                const info = {
+                                    blobUrls: [],
+                                    dataUrls: [],
+                                    pdfViewers: []
+                                };
+
+                                // Suche nach PDF.js oder ähnlichen PDF-Viewern
+                                const scripts = Array.from(document.querySelectorAll('script'));
+                                scripts.forEach(script => {
+                                    const content = script.textContent || '';
+                                    if (content.includes('pdf.js') || content.includes('pdfjs')) {
+                                        info.pdfViewers.push('PDF.js gefunden');
+                                    }
+                                });
+
+                                // Suche nach Blob URLs im gesamten DOM
+                                const allElements = document.querySelectorAll('*');
+                                allElements.forEach(el => {
+                                    ['src', 'href', 'data'].forEach(attr => {
+                                        const value = el.getAttribute(attr);
+                                        if (value) {
+                                            if (value.startsWith('blob:')) {
+                                                info.blobUrls.push(value);
+                                            } else if (value.startsWith('data:application/pdf')) {
+                                                info.dataUrls.push(value.substring(0, 100) + '...');
+                                            }
+                                        }
+                                    });
+                                });
+
+                                // Entferne Duplikate
+                                info.blobUrls = [...new Set(info.blobUrls)];
+                                info.dataUrls = [...new Set(info.dataUrls)];
+
+                                return info;
+                            }
+                        """)
+
+                        self.debug_signal.emit(f"PDF-Viewer: {js_pdf_info.get('pdfViewers', [])}")
+                        self.debug_signal.emit(f"Blob URLs: {len(js_pdf_info.get('blobUrls', []))}")
+                        self.debug_signal.emit(f"Data URLs: {len(js_pdf_info.get('dataUrls', []))}")
+
+                        # Versuche Data URLs zu laden
+                        for data_url in js_pdf_info.get('dataUrls', [])[:3]:
+                            try:
+                                self.log_signal.emit(f"📄 Versuche Data-URL PDF zu laden...")
+                                # Data URL direkt dekodieren
+                                import base64
+                                if ',' in data_url:
+                                    data = data_url.split(',', 1)[1]
+                                    pdf_data = base64.b64decode(data)
+                                    if len(pdf_data) > 1000:
+                                        self.captured_pdfs.append(pdf_data)
+                                        self.log_signal.emit(f"✅ PDF aus Data-URL geladen ({len(pdf_data)} bytes)")
+                                        break
+                            except Exception as e:
+                                self.debug_signal.emit(f"   ✗ Data-URL Fehler: {e}")
+
+                        # Wenn PDF.js gefunden wurde, suche nach dem PDF-Canvas
+                        if js_pdf_info.get('pdfViewers') and not self.captured_pdfs:
+                            self.debug_signal.emit("Suche nach PDF.js Canvas...")
+                            # Warte kurz, damit PDF.js laden kann
+                            await self.page.wait_for_timeout(2000)
+
+                            # Versuche PDF-URL aus PDF.js zu extrahieren
+                            pdf_js_url = await self.page.evaluate("""
+                                () => {
+                                    // Suche nach PDFViewerApplication (Standard PDF.js)
+                                    if (window.PDFViewerApplication && window.PDFViewerApplication.url) {
+                                        return window.PDFViewerApplication.url;
+                                    }
+                                    // Suche nach anderen PDF-Viewer-Variablen
+                                    if (window.pdfDocument && window.pdfDocument.url) {
+                                        return window.pdfDocument.url;
+                                    }
+                                    return null;
+                                }
+                            """)
+
+                            if pdf_js_url:
+                                self.log_signal.emit(f"📄 PDF.js URL gefunden: {pdf_js_url[:80]}")
+                                try:
+                                    response = await self.page.context.request.get(pdf_js_url)
+                                    if response.ok:
+                                        body = await response.body()
+                                        if len(body) > 1000:
+                                            self.captured_pdfs.append(body)
+                                            self.log_signal.emit(f"✅ PDF aus PDF.js geladen ({len(body)} bytes)")
+                                except Exception as e:
+                                    self.debug_signal.emit(f"   ✗ PDF.js URL Fehler: {e}")
+                            else:
+                                self.debug_signal.emit("Keine PDF.js URL gefunden")
+
+                    except Exception as e:
+                        self.debug_signal.emit(f"JavaScript-PDF-Suche Fehler: {e}")
+
+                # Methode 3: Prüfe alle Frames (Fallback)
+                if not self.captured_pdfs:
+                    self.debug_signal.emit("\n📌 Methode 3: Prüfe alle Frames...")
                     frames = self.page.frames
                     self.debug_signal.emit(f"Anzahl Frames: {len(frames)}")
 
@@ -1255,9 +1373,9 @@ class BrowserWorker(QThread):
                         except Exception as e:
                             self.debug_signal.emit(f"Frame {i} Fehler: {e}")
 
-                # Methode 3: Suche nach PDF-Links und lade das erste
+                # Methode 4: Suche nach PDF-Links und lade das erste
                 if not self.captured_pdfs:
-                    self.debug_signal.emit("\n📌 Methode 3: Suche PDF-Links auf Seite...")
+                    self.debug_signal.emit("\n📌 Methode 4: Suche PDF-Links auf Seite...")
                     pdf_links = await self.page.evaluate("""
                         () => {
                             const links = [];
