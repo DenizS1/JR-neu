@@ -1146,31 +1146,145 @@ class BrowserWorker(QThread):
                 display_val = val if val else "❌ Leer"
                 self.log_signal.emit(f"  • {key}: {display_val}")
             
-            # PDF prüfen
+            # PDF prüfen - VERBESSERTE METHODE
             if not self.captured_pdfs:
                 self.debug_signal.emit("\n⚠️  Kein PDF durch Response abgefangen!")
-                self.debug_signal.emit("Prüfe Frames...")
-                
-                frames = self.page.frames
-                self.debug_signal.emit(f"Anzahl Frames: {len(frames)}")
-                
-                for i, frame in enumerate(frames):
-                    try:
-                        url = frame.url
-                        self.debug_signal.emit(f"Frame {i}: {url}")
-                        
-                        if url and ("pdf" in url.lower() or url.endswith(".pdf")):
-                            self.log_signal.emit(f"📄 PDF-Frame gefunden: {url[:80]}")
-                            
-                            response = await self.page.context.request.get(url)
+                self.log_signal.emit("🔍 Suche eingebettete PDFs auf der Seite...")
+
+                # Methode 1: Suche nach iframe/embed/object-Tags mit PDF
+                self.debug_signal.emit("\n📌 Methode 1: Suche iframe/embed/object-Tags...")
+                pdf_elements = await self.page.evaluate("""
+                    () => {
+                        const elements = [];
+
+                        // Suche alle iframes
+                        document.querySelectorAll('iframe').forEach((el, idx) => {
+                            elements.push({
+                                type: 'iframe',
+                                src: el.src || el.getAttribute('src'),
+                                id: el.id,
+                                class: el.className,
+                                index: idx
+                            });
+                        });
+
+                        // Suche alle embeds
+                        document.querySelectorAll('embed').forEach((el, idx) => {
+                            elements.push({
+                                type: 'embed',
+                                src: el.src || el.getAttribute('src'),
+                                contentType: el.type,
+                                index: idx
+                            });
+                        });
+
+                        // Suche alle objects
+                        document.querySelectorAll('object').forEach((el, idx) => {
+                            elements.push({
+                                type: 'object',
+                                src: el.data || el.getAttribute('data'),
+                                contentType: el.type,
+                                index: idx
+                            });
+                        });
+
+                        return elements;
+                    }
+                """)
+
+                self.debug_signal.emit(f"Gefundene Elemente: {len(pdf_elements)}")
+                for elem in pdf_elements:
+                    self.debug_signal.emit(f"  • {elem['type']}: {elem.get('src', 'keine src')[:100]}")
+
+                # Versuche PDF aus jedem gefundenen Element zu laden
+                for elem in pdf_elements:
+                    src = elem.get('src')
+                    if not src:
+                        continue
+
+                    # Ignoriere leere oder ungültige URLs
+                    if src in ['about:blank', '', None]:
+                        continue
+
+                    # Prüfe ob es ein PDF sein könnte
+                    is_pdf_candidate = (
+                        'pdf' in src.lower() or
+                        elem.get('contentType', '').lower() == 'application/pdf' or
+                        '.pdf' in src.lower()
+                    )
+
+                    if is_pdf_candidate:
+                        try:
+                            self.log_signal.emit(f"📄 PDF-Element gefunden ({elem['type']}): {src[:80]}")
+                            self.debug_signal.emit(f"Versuche PDF zu laden von: {src}")
+
+                            # Versuche direkten Download
+                            response = await self.page.context.request.get(src)
                             if response.ok:
                                 body = await response.body()
                                 if len(body) > 1000:
                                     self.captured_pdfs.append(body)
-                                    self.log_signal.emit(f"✅ PDF aus Frame geladen ({len(body)} bytes)")
+                                    self.log_signal.emit(f"✅ PDF aus {elem['type']} geladen ({len(body)} bytes)")
                                     break
-                    except Exception as e:
-                        self.debug_signal.emit(f"Frame {i} Fehler: {e}")
+                            else:
+                                self.debug_signal.emit(f"   ✗ Response status: {response.status}")
+                        except Exception as e:
+                            self.debug_signal.emit(f"   ✗ Fehler beim Laden: {e}")
+
+                # Methode 2: Prüfe alle Frames (Fallback)
+                if not self.captured_pdfs:
+                    self.debug_signal.emit("\n📌 Methode 2: Prüfe alle Frames...")
+                    frames = self.page.frames
+                    self.debug_signal.emit(f"Anzahl Frames: {len(frames)}")
+
+                    for i, frame in enumerate(frames):
+                        try:
+                            url = frame.url
+                            self.debug_signal.emit(f"Frame {i}: {url[:100] if url else 'keine URL'}")
+
+                            if url and ("pdf" in url.lower() or url.endswith(".pdf")):
+                                self.log_signal.emit(f"📄 PDF-Frame gefunden: {url[:80]}")
+
+                                response = await self.page.context.request.get(url)
+                                if response.ok:
+                                    body = await response.body()
+                                    if len(body) > 1000:
+                                        self.captured_pdfs.append(body)
+                                        self.log_signal.emit(f"✅ PDF aus Frame geladen ({len(body)} bytes)")
+                                        break
+                        except Exception as e:
+                            self.debug_signal.emit(f"Frame {i} Fehler: {e}")
+
+                # Methode 3: Suche nach PDF-Links und lade das erste
+                if not self.captured_pdfs:
+                    self.debug_signal.emit("\n📌 Methode 3: Suche PDF-Links auf Seite...")
+                    pdf_links = await self.page.evaluate("""
+                        () => {
+                            const links = [];
+                            document.querySelectorAll('a[href*=".pdf"], a[href*="pdf"]').forEach(a => {
+                                links.push(a.href);
+                            });
+                            return links;
+                        }
+                    """)
+
+                    self.debug_signal.emit(f"Gefundene PDF-Links: {len(pdf_links)}")
+                    for link in pdf_links[:3]:
+                        self.debug_signal.emit(f"  • {link[:100]}")
+
+                    # Versuche ersten PDF-Link
+                    if pdf_links:
+                        try:
+                            link = pdf_links[0]
+                            self.log_signal.emit(f"📄 Versuche PDF-Link: {link[:80]}")
+                            response = await self.page.context.request.get(link)
+                            if response.ok:
+                                body = await response.body()
+                                if len(body) > 1000:
+                                    self.captured_pdfs.append(body)
+                                    self.log_signal.emit(f"✅ PDF aus Link geladen ({len(body)} bytes)")
+                        except Exception as e:
+                            self.debug_signal.emit(f"Link-Fehler: {e}")
             
             if not self.captured_pdfs:
                 error_msg = "❌ Kein PDF gefunden! Bitte Rechnung neu laden (F5)."
