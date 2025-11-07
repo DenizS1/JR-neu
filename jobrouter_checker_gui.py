@@ -882,7 +882,8 @@ class BrowserWorker(QThread):
                 
                 context = await self.browser.new_context(
                     viewport=None,
-                    no_viewport=True
+                    no_viewport=True,
+                    ignore_https_errors=True  # Akzeptiere selbst-signierte Zertifikate
                 )
                 
                 self.page = await context.new_page()
@@ -1232,18 +1233,44 @@ class BrowserWorker(QThread):
                                 self.log_signal.emit(f"📄 PDF-Element gefunden ({elem.get('type', 'unbekannt')}): {src[:80]}")
                                 self.debug_signal.emit(f"Versuche PDF zu laden von: {src}")
 
-                                # Versuche direkten Download
-                                response = await self.page.context.request.get(src)
-                                if response.ok:
-                                    body = await response.body()
-                                    if len(body) > 1000:
-                                        self.captured_pdfs.append(body)
-                                        self.log_signal.emit(f"✅ PDF aus {elem.get('type', 'unbekannt')} geladen ({len(body)} bytes)")
-                                        break
-                                else:
-                                    self.debug_signal.emit(f"   ✗ Response status: {response.status}")
+                                # Methode A: Versuche direkten Download via Request
+                                try:
+                                    response = await self.page.context.request.get(src)
+                                    if response.ok:
+                                        body = await response.body()
+                                        if len(body) > 1000:
+                                            self.captured_pdfs.append(body)
+                                            self.log_signal.emit(f"✅ PDF aus {elem.get('type', 'unbekannt')} geladen ({len(body)} bytes)")
+                                            break
+                                    else:
+                                        self.debug_signal.emit(f"   ✗ Request Response status: {response.status}")
+                                except Exception as req_error:
+                                    self.debug_signal.emit(f"   ✗ Request Fehler: {str(req_error)[:100]}")
+
+                                    # Methode B: Versuche mit neuer Page (Fallback für SSL-Probleme)
+                                    if not self.captured_pdfs:
+                                        self.debug_signal.emit(f"   → Versuche mit neuer Page...")
+                                        try:
+                                            pdf_page = await self.page.context.new_page()
+
+                                            # Warte auf Response beim Navigieren
+                                            async with pdf_page.expect_response(lambda r: True) as response_info:
+                                                await pdf_page.goto(src, wait_until="networkidle", timeout=10000)
+
+                                            response = await response_info.value
+                                            if response.ok:
+                                                body = await response.body()
+                                                if len(body) > 1000:
+                                                    self.captured_pdfs.append(body)
+                                                    self.log_signal.emit(f"✅ PDF mit neuer Page geladen ({len(body)} bytes)")
+                                                    await pdf_page.close()
+                                                    break
+                                            await pdf_page.close()
+                                        except Exception as page_error:
+                                            self.debug_signal.emit(f"   ✗ Page Fehler: {str(page_error)[:100]}")
+
                             except Exception as e:
-                                self.debug_signal.emit(f"   ✗ Fehler beim Laden: {e}")
+                                self.debug_signal.emit(f"   ✗ Allgemeiner Fehler: {str(e)[:100]}")
 
                 # Methode 2: Suche JavaScript-generierte PDF-URLs
                 if not self.captured_pdfs:
@@ -1363,15 +1390,38 @@ class BrowserWorker(QThread):
                             if url and ("pdf" in url.lower() or url.endswith(".pdf")):
                                 self.log_signal.emit(f"📄 PDF-Frame gefunden: {url[:80]}")
 
-                                response = await self.page.context.request.get(url)
-                                if response.ok:
-                                    body = await response.body()
-                                    if len(body) > 1000:
-                                        self.captured_pdfs.append(body)
-                                        self.log_signal.emit(f"✅ PDF aus Frame geladen ({len(body)} bytes)")
-                                        break
+                                # Versuche mit Request API
+                                try:
+                                    response = await self.page.context.request.get(url)
+                                    if response.ok:
+                                        body = await response.body()
+                                        if len(body) > 1000:
+                                            self.captured_pdfs.append(body)
+                                            self.log_signal.emit(f"✅ PDF aus Frame geladen ({len(body)} bytes)")
+                                            break
+                                except Exception as req_err:
+                                    self.debug_signal.emit(f"   ✗ Request Fehler: {str(req_err)[:80]}")
+
+                                    # Fallback: Versuche mit neuer Page
+                                    if not self.captured_pdfs:
+                                        try:
+                                            pdf_page = await self.page.context.new_page()
+                                            async with pdf_page.expect_response(lambda r: True) as response_info:
+                                                await pdf_page.goto(url, wait_until="networkidle", timeout=10000)
+
+                                            response = await response_info.value
+                                            if response.ok:
+                                                body = await response.body()
+                                                if len(body) > 1000:
+                                                    self.captured_pdfs.append(body)
+                                                    self.log_signal.emit(f"✅ PDF aus Frame mit neuer Page geladen ({len(body)} bytes)")
+                                                    await pdf_page.close()
+                                                    break
+                                            await pdf_page.close()
+                                        except Exception as page_err:
+                                            self.debug_signal.emit(f"   ✗ Page Fehler: {str(page_err)[:80]}")
                         except Exception as e:
-                            self.debug_signal.emit(f"Frame {i} Fehler: {e}")
+                            self.debug_signal.emit(f"Frame {i} Fehler: {str(e)[:100]}")
 
                 # Methode 4: Suche nach PDF-Links und lade das erste
                 if not self.captured_pdfs:
@@ -1392,17 +1442,36 @@ class BrowserWorker(QThread):
 
                     # Versuche ersten PDF-Link
                     if pdf_links:
+                        link = pdf_links[0]
+                        self.log_signal.emit(f"📄 Versuche PDF-Link: {link[:80]}")
+
+                        # Versuche mit Request API
                         try:
-                            link = pdf_links[0]
-                            self.log_signal.emit(f"📄 Versuche PDF-Link: {link[:80]}")
                             response = await self.page.context.request.get(link)
                             if response.ok:
                                 body = await response.body()
                                 if len(body) > 1000:
                                     self.captured_pdfs.append(body)
                                     self.log_signal.emit(f"✅ PDF aus Link geladen ({len(body)} bytes)")
-                        except Exception as e:
-                            self.debug_signal.emit(f"Link-Fehler: {e}")
+                        except Exception as req_err:
+                            self.debug_signal.emit(f"   ✗ Link Request Fehler: {str(req_err)[:80]}")
+
+                            # Fallback: Versuche mit neuer Page
+                            if not self.captured_pdfs:
+                                try:
+                                    pdf_page = await self.page.context.new_page()
+                                    async with pdf_page.expect_response(lambda r: True) as response_info:
+                                        await pdf_page.goto(link, wait_until="networkidle", timeout=10000)
+
+                                    response = await response_info.value
+                                    if response.ok:
+                                        body = await response.body()
+                                        if len(body) > 1000:
+                                            self.captured_pdfs.append(body)
+                                            self.log_signal.emit(f"✅ PDF aus Link mit neuer Page geladen ({len(body)} bytes)")
+                                    await pdf_page.close()
+                                except Exception as page_err:
+                                    self.debug_signal.emit(f"   ✗ Link Page Fehler: {str(page_err)[:80]}")
             
             if not self.captured_pdfs:
                 error_msg = "❌ Kein PDF gefunden! Bitte Rechnung neu laden (F5)."
